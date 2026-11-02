@@ -1,5 +1,5 @@
-"""Measures of a movement, and the labels to compare visits (pre / post) and arms (affected / less affected).
-Used by exploration/01_patient_visits.ipynb; the pipeline will reuse them later.
+"""Measures of a movement, and the labels to compare visits (pre / post) and arms (contralesional / ipsilesional,
+affected / less affected). Used by exploration/01_patient_visits.ipynb; the pipeline will reuse the measures later.
 
 Input: the cut movements of step 3 (movement_cut.parquet): filtered positions in the person's own directions
 (forward / out / up, metres), measured from the shoulder (shoulder = 0), left arm mirrored, on the trial's regular
@@ -27,7 +27,7 @@ VISIT_LABELS = {1: "pre", 2: "post"}   # a treatment was given between the 2 vis
 
 def load_data(processed_root=PROCESSED_ROOT, participants_csv=PARTICIPANTS_CSV):
     """The cut movements (positions per moment, step 3) and one row per trial kept by step 3, with: who (person,
-    condition, affected_side), visit (1, 2) and visit_label (pre, post), arm_label, the checks of step 1
+    condition, affected_side, lesion_side), visit (1, 2) and visit_label (pre, post), arm_label, the checks of step 1
     (passes_checks, is_first_repetition, end_type), frame_rate_hz and arm_length_m (step 2), movement_duration_s (step 3)."""
     movement_cut, cut_trials, trials, sessions, kinematics_trials = shapes.load_inputs(processed_root)
     info = shapes.trial_info(trials, shapes.session_people(sessions), kinematics_trials, cut_trials)
@@ -35,22 +35,31 @@ def load_data(processed_root=PROCESSED_ROOT, participants_csv=PARTICIPANTS_CSV):
             .merge(kinematics_trials[["trial_id", "frame_rate_hz"]], on="trial_id")
             .merge(trials[["trial_id", "end_type"]], on="trial_id"))
     participants = read_hand_filled_csv(participants_csv).set_index("participant_id")
-    if "affected_side" in participants:
-        info["affected_side"] = info["person"].map(participants["affected_side"])
-    else:
-        info["affected_side"] = np.nan
+    for column in ["affected_side", "lesion_side"]:   # filled by hand; empty = unknown
+        info[column] = info["person"].map(participants[column]) if column in participants else np.nan
     info["arm_label"] = arm_labels(info)
     info["visit_label"] = info["visit"].map(VISIT_LABELS)
     return movement_cut, info
 
 
+def _side(column):
+    """A side column of participants.csv as "left", "right" or "" (unknown), whatever the case or spaces."""
+    return column.astype("string").str.strip().str.lower().fillna("")
+
+
 def arm_labels(trials):
-    """The arm of each trial: "affected" / "less affected" when the person's affected side is known
-    (affected_side in participants.csv), otherwise "left" / "right". Healthy participants: always "left" / "right"."""
-    affected_side = trials["affected_side"].astype("string").str.strip().str.lower().fillna("")   # "" = unknown
-    known = affected_side.isin(["left", "right"]) & (trials["condition"] != "healthy")
-    label = np.where(trials["side"] == affected_side, "affected", "less affected")
-    return pd.Series(np.where(known, label, trials["side"]), index=trials.index)
+    """The arm of each trial (participants.csv), in this order of preference:
+    - lesion_side known (stroke: the brain hemisphere of the lesion): "contralesional" = the arm on the other side
+      (usually the affected one) / "ipsilesional" = the arm on the same side;
+    - otherwise affected_side known: "affected" / "less affected";
+    - otherwise: "left" / "right".
+    Healthy participants: always "left" / "right"."""
+    lesion, affected = _side(trials["lesion_side"]), _side(trials["affected_side"])
+    patient = trials["condition"] != "healthy"
+    by_lesion = np.where(trials["side"] == lesion, "ipsilesional", "contralesional")
+    by_affected = np.where(trials["side"] == affected, "affected", "less affected")
+    return pd.Series(np.select([patient & lesion.isin(["left", "right"]), patient & affected.isin(["left", "right"])],
+                               [by_lesion, by_affected], trials["side"]), index=trials.index)
 
 
 def select_trials(info, settings):
@@ -64,39 +73,75 @@ def select_trials(info, settings):
     return info[keep]
 
 
-def patient_trials(selected, patient, task_id):
-    """The selected trials of one patient in one task, in sessions with a known visit (pre or post)."""
-    keep = (selected["person"] == patient) & (selected["task_id"] == task_id) & selected["visit_label"].notna()
+def in_tasks(trials, tasks):
+    """True for the trials of the chosen tasks: a list (e.g. [1, 2]), one task (e.g. 2), or None = all tasks."""
+    return trials["task_id"].isin(np.atleast_1d(tasks)) if tasks is not None else pd.Series(True, index=trials.index)
+
+
+def of_task(trials, task_id):
+    """The trials of one task."""
+    return trials[trials["task_id"] == task_id]
+
+
+def task_title(info, task_id):
+    """e.g. "Task 2 (Shoulder abduction with elbow extended)"."""
+    return f"Task {task_id} ({info.loc[info['task_id'] == task_id, 'task_name'].iloc[0]})"
+
+
+def patient_trials(selected, patients, tasks=None):
+    """The selected trials of the chosen patients (one participant_id or a list) in the chosen tasks (list, one task,
+    or None = all), in sessions with a known visit (pre or post)."""
+    keep = selected["person"].isin(np.atleast_1d(patients)) & in_tasks(selected, tasks) & selected["visit_label"].notna()
     return selected[keep]
 
 
-def healthy_trials(selected, task_id, show=True):
-    """The selected trials of the healthy participants in one task (both arms: the left arm is mirrored, so both are
-    comparable), as a grey reference. Empty if show is False."""
-    keep = (selected["condition"] == "healthy") & (selected["task_id"] == task_id) & show
+def describe_choice(info, patients, tasks):
+    """Prints what the settings PATIENTS and TASKS select: for each patient, the condition and the visits found
+    (a warning for an unknown participant_id), and the names of the tasks."""
+    for patient in map(str, np.atleast_1d(patients)):
+        own = info[info["person"] == patient]
+        if own.empty:
+            print(f"WARNING: no trials for '{patient}': check the participant_id (session_participant.csv)")
+            continue
+        visits = [v for v in VISIT_LABELS.values() if v in set(own["visit_label"])]
+        print(f"{patient} ({own['condition'].iloc[0]}): visits {', '.join(visits) or 'none (visit column empty)'}")
+    for task_id in np.atleast_1d(tasks) if tasks is not None else sorted(info["task_id"].unique()):
+        print(task_title(info, task_id))
+
+
+def healthy_trials(selected, tasks=None, show=True):
+    """The selected trials of the healthy participants in the chosen tasks (list, one task, or None = all), both arms
+    (the left arm is mirrored, so both are comparable), as a grey reference. Empty if show is False."""
+    keep = (selected["condition"] == "healthy") & in_tasks(selected, tasks) & show
     return selected[keep]
 
 
-def patients_with_two_visits(info):
-    """Persons who have both visit 1 and visit 2 (from session_participant.csv)."""
-    visits = info.dropna(subset=["visit"]).groupby("person")["visit"].agg(set)
-    return sorted(person for person, done in visits.items() if {1, 2} <= done)
+def healthy_overview(healthy):
+    """Per task, what the healthy reference is made of: number of trials and sessions, which arm, the camera frame
+    rate and how the trials were ended (% by the operator)."""
+    return (healthy.groupby(["task_id", "task_name"])
+            .agg(trials=("trial_id", "size"), sessions=("session_id", "nunique"),
+                 right_arm=("side", lambda sides: (sides == "right").sum()),
+                 left_arm=("side", lambda sides: (sides == "left").sum()),
+                 frames_per_second=("frame_rate_hz", "median"),
+                 ended_by_operator_pct=("end_type", lambda ends: 100 * (ends == "manual").mean()))
+            .round({"frames_per_second": 1, "ended_by_operator_pct": 0}))
 
 
-def two_visit_trials(selected, info, task_id):
-    """The selected trials, in one task, of all the patients who have 2 visits (pre and post)."""
-    keep = (selected["person"].isin(patients_with_two_visits(info)) & (selected["task_id"] == task_id)
-            & selected["visit_label"].notna())
-    return selected[keep]
+def trials_per_task(patients):
+    """Number of trials per task (rows) and per patient and visit (columns)."""
+    visit = pd.Categorical(patients["visit_label"], list(VISIT_LABELS.values()), ordered=True)
+    return pd.crosstab([patients["task_id"], patients["task_name"]], [patients["person"], visit],
+                       colnames=["person", "visit"])
 
 
-def visits_table(info, session_participant_csv=SESSION_PARTICIPANT_CSV):
-    """The sessions of the patients who have 2 visits, as used here: which visit, when it was recorded, the ID typed
+def visits_table(info, patients, session_participant_csv=SESSION_PARTICIPANT_CSV):
+    """The sessions of the chosen patients, as used here: which visit, when it was recorded, the ID typed
     during the recording, the number of trials (kept by step 3, all tasks), the camera frame rate, how the trials
     were ended (% by the operator), and the notes of session_participant.csv (where the assignments made by hand,
     to be confirmed, are written)."""
     hand = read_hand_filled_csv(session_participant_csv).set_index("session_id")
-    rows = info[info["person"].isin(patients_with_two_visits(info))].copy()
+    rows = info[info["person"].isin(np.atleast_1d(patients)) & info["visit_label"].notna()].copy()
     rows["visit_label"] = pd.Categorical(rows["visit_label"], list(VISIT_LABELS.values()), ordered=True)
     table = (rows.groupby(["person", "condition", "visit_label", "session_id"], observed=True)
              .agg(trials=("trial_id", "size"), frames_per_second=("frame_rate_hz", "median"),
@@ -107,22 +152,6 @@ def visits_table(info, session_participant_csv=SESSION_PARTICIPANT_CSV):
     table["typed_id"] = table["session_id"].map(hand["typed_id"]).fillna("(none)")
     table["notes"] = table["session_id"].map(hand["notes"]).fillna("")
     return table.drop(columns="session_id").round({"frames_per_second": 1, "ended_by_operator_pct": 0})
-
-
-def visits_overview(selected, info, patient):
-    """For one patient: number of trials per visit and arm (rows) and task (columns), and the median camera frame
-    rate of each visit (jerk depends on it). Prints a message if the patient has only one visit."""
-    own = info[info["person"] == patient]
-    visits = sorted(own["visit_label"].dropna().unique(), key=list(VISIT_LABELS.values()).index)
-    if len(visits) < 2:
-        print(f"{patient} has only one visit ({', '.join(visits) or 'none'}): only this visit is shown.")
-    rates = own.groupby("visit_label")["frame_rate_hz"].median().round(1)
-    print("Camera frame rate (median, frames per second): "
-          + ", ".join(f"{visit} {rates[visit]}" for visit in visits))
-    table = pd.crosstab([selected.loc[selected["person"] == patient, "visit_label"],
-                         selected.loc[selected["person"] == patient, "arm_label"]],
-                        selected.loc[selected["person"] == patient, "task_id"])
-    return table.reindex(visits, level=0)
 
 
 # ---- Angles (per moment) ----
@@ -278,8 +307,8 @@ def _clean(ax):
 
 
 def _arm_order(patient):
-    """The patient's arm labels in a fixed order (affected first)."""
-    order = ["affected", "less affected", "left", "right"]
+    """The patient's arm labels in a fixed order (contralesional or affected first)."""
+    order = ["contralesional", "ipsilesional", "affected", "less affected", "left", "right"]
     return sorted(patient["arm_label"].unique(), key=order.index)
 
 
@@ -296,6 +325,30 @@ def _y_label(column, settings):
         return f"{column.removesuffix('_deg').replace('_', ' ')} (degrees)"
     unit = "arm lengths" if settings["size_normalize"] else "m"
     return f"{column.replace('_', ' ')} ({unit})"
+
+
+NUMBER_LABELS = {
+    "movement_duration_s": "movement duration (s)",
+    "shoulder_range_deg": "shoulder range (degrees)",
+    "elbow_range_deg": "elbow range (degrees)",
+    "max_elbow_angle_deg": "largest elbow angle (degrees)",
+    "coupling_r": "shoulder-elbow coupling (correlation)",
+    "mean_squared_jerk": "mean squared jerk ((m/s3)2)",
+    "ldlj": "LDLJ (closer to 0 = smoother)",
+}
+
+
+def _number_label(measure):
+    """Readable name of a per-trial number, with its unit."""
+    return NUMBER_LABELS.get(measure, measure.replace("_", " "))
+
+
+def _nothing_to_draw(trials, title):
+    """True (and prints a message) when there is no trial to draw, e.g. a patient without trials in this task."""
+    if trials.empty:
+        print(f"Nothing to draw for {title}: no trials (check PATIENTS, TASKS and the trial selection).")
+        return True
+    return False
 
 
 def _most_trials(grouped, n_trials):
@@ -325,31 +378,11 @@ def _curve_panel(ax, curve_table, patient, arm, healthy, column):
     _clean(ax)
 
 
-def plot_curves(curve_table, patient, healthy_ids, columns, settings, title):
-    """One row per column, one panel per arm label. Every repetition = thin line, mean = thick line, pre (blue) and
-    post (orange). Healthy participants (same task, both arms): median (grey line) and 25-75 % band (grey area)."""
-    arms = _arm_order(patient)
-    fig, panels = plt.subplots(len(columns), len(arms), figsize=(6 * len(arms), 3.1 * len(columns)),
-                               squeeze=False, sharex=True)
-    healthy = curve_table[curve_table["trial_id"].isin(healthy_ids)]
-    for j, arm in enumerate(arms):
-        for i, column in enumerate(columns):
-            ax = panels[i][j]
-            _curve_panel(ax, curve_table, patient, arm, healthy, column)
-            ax.set_ylabel(_y_label(column, settings), fontsize=9, color=INK_SECONDARY)
-            if i == 0:
-                ax.set_title(f"{arm} arm", fontsize=10, color=INK)
-            if i == len(columns) - 1:
-                ax.set_xlabel(_x_label(settings), fontsize=9, color=INK_SECONDARY)
-    _legend(fig, patient, healthy["trial_id"].nunique(), with_mean=True)
-    fig.suptitle(title, fontsize=11, color=INK)
-    fig.tight_layout()
-    plt.show()
-
-
 def plot_curves_patients(curve_table, patients, healthy_ids, column, settings, title):
     """The same as plot_curves for one column, for several patients: one row per patient, one panel per arm
     (affected first if known, otherwise left then right). Same y scale in every panel, to compare the patients."""
+    if _nothing_to_draw(patients, title):
+        return
     persons = list(dict.fromkeys(patients.sort_values("person")["person"]))
     fig, panels = plt.subplots(len(persons), 2, figsize=(12, 3 * len(persons)), squeeze=False, sharex=True, sharey=True)
     healthy = curve_table[curve_table["trial_id"].isin(healthy_ids)]
@@ -366,73 +399,20 @@ def plot_curves_patients(curve_table, patients, healthy_ids, column, settings, t
             ax.set_ylabel(_y_label(column, settings), fontsize=9, color=INK_SECONDARY)
             if i == len(persons) - 1:
                 ax.set_xlabel(_x_label(settings), fontsize=9, color=INK_SECONDARY)
-    _legend(fig, patients, healthy["trial_id"].nunique(), with_mean=True, counts=False)
+    _legend(fig, patients, healthy["trial_id"].nunique())
     fig.suptitle(f"{title}: {_y_label(column, settings)}", fontsize=11, color=INK)
     fig.tight_layout()
     plt.show()
 
 
-def _legend(fig, patient, n_healthy, with_mean, counts=True):
-    """Legend: pre and post (with their number of trials, both arms together, if counts), and the healthy reference.
-    with_mean: the curve plots (thin = each repetition, thick = mean; healthy median and 25-75 % band);
-    otherwise one line per trial (healthy trials as light grey lines)."""
-    detail = ": thin = each repetition, thick = mean" if with_mean else ""
-    handles = [Line2D([], [], color=VISIT_COLOURS[v], linewidth=2.5 if with_mean else 1.5,
-                      label=(f"{v} ({(patient['visit_label'] == v).sum()} trials, both arms)" if counts else v) + detail)
-               for v in _visit_order(patient)]
-    if n_healthy and with_mean:
+def _legend(fig, patients, n_healthy):
+    """Legend of the curve plot: pre and post (thin = each repetition, thick = mean), and the healthy reference."""
+    handles = [Line2D([], [], color=VISIT_COLOURS[v], linewidth=2.5, label=f"{v}: thin = each repetition, thick = mean")
+               for v in _visit_order(patients)]
+    if n_healthy:
         handles.append(Line2D([], [], color=HEALTHY_LINE, linewidth=1.5, label=f"healthy median ({n_healthy} trials)"))
         handles.append(Patch(color=HEALTHY_FILL, label="healthy 25-75 %"))
-    elif n_healthy:
-        handles.append(Line2D([], [], color=HEALTHY_FILL, linewidth=1.5, label=f"healthy ({n_healthy} trials)"))
     fig.legend(handles=handles, frameon=False, fontsize=9, loc="upper left", bbox_to_anchor=(1, 0.95))
-
-
-def plot_elbow_distribution(moments, patient, healthy_ids, bin_width_deg=5):
-    """Histogram of elbow_angle_deg over all moments of the movement, pre vs post, one panel per arm label.
-    Each histogram is scaled to an area of 1 (visits do not have the same number of moments). Healthy: grey area."""
-    arms = _arm_order(patient)
-    bins = np.arange(0, 180 + bin_width_deg, bin_width_deg)
-    healthy = moments.loc[moments["trial_id"].isin(healthy_ids), "elbow_angle_deg"].dropna()
-    fig, panels = plt.subplots(1, len(arms), figsize=(6 * len(arms), 3.4), squeeze=False)
-    for ax, arm in zip(panels[0], arms):
-        if len(healthy):
-            ax.hist(healthy, bins=bins, density=True, color=HEALTHY_FILL, label="healthy")
-        for visit in _visit_order(patient):
-            ids = patient.loc[(patient["arm_label"] == arm) & (patient["visit_label"] == visit), "trial_id"]
-            values = moments.loc[moments["trial_id"].isin(ids), "elbow_angle_deg"].dropna()
-            if len(values):
-                ax.hist(values, bins=bins, density=True, histtype="step", linewidth=2, color=VISIT_COLOURS[visit],
-                        label=visit)
-        ax.set_title(f"{arm} arm", fontsize=10, color=INK)
-        ax.set_xlabel("elbow angle (degrees, 180 = straight arm)", fontsize=9, color=INK_SECONDARY)
-        ax.set_ylabel("share of the moments (per degree)", fontsize=9, color=INK_SECONDARY)
-        _clean(ax)
-    panels[0][-1].legend(frameon=False, fontsize=9, loc="upper left")
-    fig.suptitle("Elbow angle over all moments of the movement", fontsize=11, color=INK)
-    fig.tight_layout()
-    plt.show()
-
-
-def plot_trial_points(per_trial, patient, healthy_ids, measure, title, log_scale=False):
-    """One value per trial as a point: pre, post and healthy side by side, one panel per arm label.
-    Short black line = median. log_scale: for numbers that span several orders of magnitude (e.g. jerk)."""
-    arms = _arm_order(patient)
-    values = per_trial.set_index("trial_id")[measure]
-    healthy = values.reindex(healthy_ids).dropna()
-    fig, panels = plt.subplots(1, len(arms), figsize=(4.2 * len(arms), 3.6), squeeze=False, sharey=True)
-    for ax, arm in zip(panels[0], arms):
-        groups = [(visit, VISIT_COLOURS[visit], _values_of(values, patient, arm, visit)) for visit in _visit_order(patient)]
-        if len(healthy):
-            groups.append(("healthy", HEALTHY_LINE, healthy))
-        _draw_points(ax, groups)
-        ax.set_title(f"{arm} arm", fontsize=10, color=INK)
-        if log_scale:
-            ax.set_yscale("log")
-    panels[0][0].set_ylabel(measure.replace("_", " "), fontsize=9, color=INK_SECONDARY)
-    fig.suptitle(f"{title} (each point = one trial, black line = median)", fontsize=11, color=INK)
-    fig.tight_layout(rect=(0, 0, 1, 0.98))   # leave room for the title above the panel titles
-    plt.show()
 
 
 def _values_of(values, patient, arm, visit):
@@ -459,6 +439,8 @@ def plot_measures_patients(per_trial, patients, healthy_ids, measure_names, titl
     """Several patients side by side: one row per measure, one column per patient. In each panel, for each arm:
     pre (blue) and post (orange), then the healthy trials (grey). Each point = one trial, black line = median.
     Same y scale along a row, to compare the patients."""
+    if _nothing_to_draw(patients, title):
+        return
     persons = list(dict.fromkeys(patients.sort_values("person")["person"]))
     fig, panels = plt.subplots(len(measure_names), len(persons), figsize=(4.6 * len(persons), 3 * len(measure_names)),
                                squeeze=False, sharey="row")
@@ -478,76 +460,76 @@ def plot_measures_patients(per_trial, patients, healthy_ids, measure_names, titl
             if i == 0:
                 ax.set_title(f"{person} ({own['condition'].iloc[0]})", fontsize=10, color=INK)
             if j == 0:
-                ax.set_ylabel(measure.replace("_", " "), fontsize=9, color=INK_SECONDARY)
+                ax.set_ylabel(_number_label(measure), fontsize=9, color=INK_SECONDARY)
     fig.suptitle(f"{title} (each point = one trial, black line = median)", fontsize=11, color=INK)
     fig.tight_layout(rect=(0, 0, 1, 0.98))   # leave room for the title above the panel titles
     plt.show()
 
 
-def plot_angle_paths(moments, patient, healthy_ids):
-    """For each trial: shoulder elevation (x) against elbow angle (y) over the movement, one thin line per trial,
-    pre and post in 2 colours, one panel per arm label. Healthy trials: light grey lines behind."""
-    arms = _arm_order(patient)
-    fig, panels = plt.subplots(1, len(arms), figsize=(5.5 * len(arms), 4.6), squeeze=False, sharex=True, sharey=True)
-    for ax, arm in zip(panels[0], arms):
-        for _, trial in moments[moments["trial_id"].isin(healthy_ids)].groupby("trial_id"):
-            ax.plot(trial["shoulder_elevation_deg"], trial["elbow_angle_deg"], color=HEALTHY_FILL, linewidth=0.8)
-        for visit in _visit_order(patient):
-            ids = patient.loc[(patient["arm_label"] == arm) & (patient["visit_label"] == visit), "trial_id"]
-            for _, trial in moments[moments["trial_id"].isin(ids)].groupby("trial_id"):
-                ax.plot(trial["shoulder_elevation_deg"], trial["elbow_angle_deg"], color=VISIT_COLOURS[visit],
-                        linewidth=1, alpha=0.6)
-        ax.set_title(f"{arm} arm", fontsize=10, color=INK)
-        ax.set_xlabel("shoulder elevation (degrees, 0 = hanging, 90 = horizontal)", fontsize=9, color=INK_SECONDARY)
-        ax.set_ylabel("elbow angle (degrees, 180 = straight)", fontsize=9, color=INK_SECONDARY)
+ARM_LINES = {"contralesional": "--", "ipsilesional": "-", "affected": "--", "less affected": "-", "left": "--",
+             "right": "-"}
+# One colour per patient, avoiding blue and orange (= pre and post in the other plots). Checked for colour-blind
+# readers (Machado 2009 simulation, OKLab): worst normal-vision difference 15.6 (>= 15), worst colour-blind 9.1 (>= 8).
+# Valid for these 3 colours only: with more patients the colours repeat, and the markers keep them apart.
+PATIENT_COLOURS = ["#1baf7a", "#eda100", "#008300"]   # aqua, yellow, green
+PATIENT_MARKERS = ["o", "s", "D", "^", "v", "P"]
+
+
+def _patient_styles(patients):
+    """{person: (colour, marker, label)}, in alphabetical order, e.g. {"DBB": ("#1baf7a", "o", "DBB (Stroke)"), ...}."""
+    people = patients[["person", "condition"]].drop_duplicates("person").sort_values("person")
+    return {row.person: (PATIENT_COLOURS[i % len(PATIENT_COLOURS)], PATIENT_MARKERS[i % len(PATIENT_MARKERS)],
+                         f"{row.person} ({row.condition})") for i, row in enumerate(people.itertuples())}
+
+
+def plot_visits_all_tasks(per_trial, patients, healthy, measure, log_scale=False):
+    """All tasks at a glance for one number: one panel per task, x = visit (pre, post), y = the median of `measure`
+    over the trials of each patient and arm: one line each (colour and marker = patient; solid = ipsilesional, less
+    affected or right arm, dashed = contralesional, affected or left arm). Grey: the healthy trials of the task
+    (median line and 25-75 % band). patients and healthy: their trials in all tasks."""
+    if _nothing_to_draw(patients, measure):
+        return
+    styles = _patient_styles(patients)
+    values = per_trial.set_index("trial_id")[measure]
+    medians = (patients.assign(value=patients["trial_id"].map(values))
+               .groupby(["task_id", "person", "arm_label", "visit_label"])["value"].median())
+    tasks = patients[["task_id", "task_name"]].drop_duplicates().sort_values("task_id")
+    n_columns = min(4, len(tasks))
+    n_rows = int(np.ceil(len(tasks) / n_columns))
+    fig, panels = plt.subplots(n_rows, n_columns, figsize=(4 * n_columns, 3.75 * n_rows), squeeze=False)
+    for ax in panels.ravel()[len(tasks):]:
+        ax.set_visible(False)
+    for ax, task in zip(panels.ravel(), tasks.itertuples()):
+        reference = values.reindex(healthy.loc[healthy["task_id"] == task.task_id, "trial_id"]).dropna()
+        if len(reference):
+            ax.axhspan(reference.quantile(0.25), reference.quantile(0.75), color=HEALTHY_FILL, linewidth=0)
+            ax.axhline(reference.median(), color=HEALTHY_LINE, linewidth=1.5)
+        if task.task_id in medians.index.get_level_values("task_id"):
+            for (person, arm), line in medians.loc[task.task_id].groupby(level=["person", "arm_label"]):
+                line = line.droplevel(["person", "arm_label"]).reindex(list(VISIT_LABELS.values()))
+                colour, marker, _ = styles[person]
+                ax.plot([0, 1], line.to_numpy(), color=colour, marker=marker, markersize=8, markeredgecolor="white",
+                        linewidth=2, linestyle=ARM_LINES.get(arm, "-"))
+        ax.set_xticks([0, 1], list(VISIT_LABELS.values()))
+        ax.set_xlim(-0.3, 1.3)
+        ax.set_title(f"{task.task_id}. {task.task_name}", fontsize=9, color=INK)
+        if log_scale:
+            ax.set_yscale("log")
         _clean(ax)
-    _legend(fig, patient, len(set(healthy_ids)), with_mean=False)
-    fig.suptitle("Coupling: elbow angle against shoulder elevation, one line per trial", fontsize=11, color=INK)
-    fig.tight_layout()
+    for ax in panels[:, 0]:
+        ax.set_ylabel(f"median {_number_label(measure)}", fontsize=9, color=INK_SECONDARY)
+
+    handles = [Line2D([], [], color=colour, marker=marker, markersize=8, linewidth=2, label=label)
+               for colour, marker, label in styles.values()]
+    arms = sorted(set(patients["arm_label"]), key=list(ARM_LINES).index)
+    handles += [Line2D([], [], color=INK_SECONDARY, linewidth=2, linestyle=ARM_LINES[arm], label=f"{arm} arm")
+                for arm in arms]
+    if len(healthy):
+        handles += [Line2D([], [], color=HEALTHY_LINE, linewidth=1.5, label="healthy median"),
+                    Patch(color=HEALTHY_FILL, label="healthy 25-75 %")]
+    fig.legend(handles=handles, frameon=False, fontsize=9, loc="upper left", bbox_to_anchor=(1, 0.95))
+    fig.suptitle(f"Median {_number_label(measure)} per visit, per patient and arm", fontsize=11, color=INK)
+    fig.tight_layout(rect=(0, 0, 1, 0.97))
     plt.show()
 
 
-def _ldlj_rate_correlation(trials):
-    """Spearman correlation between ldlj and frame_rate_hz (rank-based: any monotonic relation counts)."""
-    return trials["ldlj"].corr(trials["frame_rate_hz"], method="spearman")
-
-
-def frame_rate_check(per_trial):
-    """Is the jerk influenced by the camera rate? ldlj against frame_rate_hz for all trials (grey points), and the
-    Spearman correlation per task and over all trials. Returns the table of correlations.
-    |r| >= 0.5 = strongly related: then the camera rate influences the jerk, and visits filmed at different rates
-    should not be compared on jerk."""
-    data = per_trial.dropna(subset=["ldlj", "frame_rate_hz"])
-    fig, ax = plt.subplots(figsize=(7, 4))
-    ax.scatter(data["frame_rate_hz"], data["ldlj"], s=10, color=HEALTHY_LINE, alpha=0.4, linewidth=0)
-    ax.set_xlabel("camera frame rate of the trial (frames per second)", fontsize=9, color=INK_SECONDARY)
-    ax.set_ylabel("ldlj (closer to 0 = smoother)", fontsize=9, color=INK_SECONDARY)
-    ax.set_title(f"All trials ({len(data)}): smoothness against camera rate", fontsize=11, color=INK)
-    _clean(ax)
-    fig.tight_layout()
-    plt.show()
-
-    table = data.groupby(["task_id", "task_name"]).apply(_ldlj_rate_correlation, include_groups=False)
-    table = table.rename("spearman_r").to_frame()
-    table.loc[("all", "all tasks"), "spearman_r"] = _ldlj_rate_correlation(data)
-    strong = table["spearman_r"].abs() >= 0.5
-    if strong.any():
-        print(f"Strongly related (|r| >= 0.5) in {strong.sum()} of {len(table)} rows: the camera rate influences the jerk. "
-              "Compare visits on jerk only if they were filmed at the same rate.")
-    else:
-        print("No strong relation (all |r| < 0.5) between the camera rate and the jerk.")
-    return table.round(2)
-
-
-def summary_table(per_trial, patients):
-    """Per patient, visit and arm label: number of trials and the medians of: movement duration, largest elbow angle,
-    range of the shoulder elevation, coupling correlation, ldlj, and the camera frame rate (the jerk depends on it).
-    patients: the trials of one or several patients."""
-    rows = per_trial[per_trial["trial_id"].isin(patients["trial_id"])].copy()
-    rows["visit_label"] = pd.Categorical(rows["visit_label"], list(VISIT_LABELS.values()), ordered=True)
-    return (rows.groupby(["person", "visit_label", "arm_label"], observed=True)
-            .agg(trials=("trial_id", "size"), movement_duration_s=("movement_duration_s", "median"),
-                 max_elbow_angle_deg=("max_elbow_angle_deg", "median"),
-                 shoulder_range_deg=("shoulder_range_deg", "median"), coupling_r=("coupling_r", "median"),
-                 ldlj=("ldlj", "median"), frame_rate_hz=("frame_rate_hz", "median"))
-            .round(2))

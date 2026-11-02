@@ -30,9 +30,11 @@ KEYPOINTS = ["nose", "left_eye", "right_eye", "left_ear", "right_ear", "body_cen
 KEYPOINT_COLUMNS = [f"{point}_{value}" for point in KEYPOINTS for value in ("x", "y", "z", "conf")]
 
 # Columns of participants.csv (filled in by hand). condition: "healthy", the diagnosis (e.g. "Stroke"), or "unknown".
-# affected_side: "left", "right", or empty = unknown. first_visit / second_visit: date and hour of the visits given by
+# affected_side: the more affected arm, "left", "right", or empty = unknown. lesion_side (stroke): the brain hemisphere
+# of the lesion, "left", "right", or empty = unknown. first_visit / second_visit: date and hour of the visits given by
 # the clinical team, for reference only.
-PARTICIPANT_COLUMNS = ["participant_id", "condition", "affected_side", "first_visit", "second_visit", "notes"]
+PARTICIPANT_COLUMNS = ["participant_id", "condition", "affected_side", "lesion_side", "first_visit", "second_visit",
+                       "notes"]
 
 
 # ---- Reading the raw files ----

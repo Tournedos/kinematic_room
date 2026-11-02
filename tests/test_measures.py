@@ -65,5 +65,13 @@ def test_coupling_is_minus_one_when_the_elbow_closes_as_the_arm_goes_up():
 def test_arm_label():
     trials = pd.DataFrame({"side": ["left", "right", "left", "left"],
                            "affected_side": ["left", "left", None, "left"],
+                           "lesion_side": [None, None, None, None],
                            "condition": ["Stroke", "Stroke", "Stroke", "healthy"]})
     assert measures.arm_labels(trials).tolist() == ["affected", "less affected", "left", "left"]
+
+
+def test_arm_label_from_the_lesion_side():
+    # lesion in the right hemisphere: the left arm is contralesional, the right arm ipsilesional (whatever affected_side)
+    trials = pd.DataFrame({"side": ["left", "right", "left"], "affected_side": ["left", "left", None],
+                           "lesion_side": ["Right ", "right", "right"], "condition": ["Stroke", "Stroke", "healthy"]})
+    assert measures.arm_labels(trials).tolist() == ["contralesional", "ipsilesional", "left"]
